@@ -631,7 +631,424 @@ void write_stack_register(...) {
 
 ---
 
-**Дата составления:** 2025-11-27
-**Автор анализа:** Claude (Anthropic AI - Экспертный построчный анализ)
-**Методология:** Ручной построчный разбор, анализ алгоритмов, проверка граничных условий
-**Использованные инструменты:** Статический анализ, трассировка выполнения, анализ зависимостей
+## 12. ДОПОЛНИТЕЛЬНЫЕ КРИТИЧЕСКИЕ НАХОДКИ (ВТОРОЙ ПРОХОД)
+
+### 12.1 КРИТИЧЕСКАЯ ПРОБЛЕМА: Потенциальный underflow в seek_program_END
+
+**Файл:** `tools.cpp:80-89`
+**Серьезность:** КРИТИЧЕСКАЯ
+
+```cpp
+usize seek_program_END(u8* code_page) {
+  isize lastCommand = 105;
+  while (code_page[lastCommand] == 0) {
+    lastCommand--;  // ⚠️ ПРОБЛЕМА: Нет проверки на отрицательные значения!
+  }
+
+  if(lastCommand < 105) lastCommand++;
+  if(lastCommand < 105) lastCommand++;
+
+  return lastCommand;
+}
+```
+
+**Анализ проблемы:**
+- Если ВСЯ программа состоит из нулей (пустая программа)
+- `lastCommand` будет декрементироваться: 105 → 104 → ... → 0 → -1 → -2 → ...
+- `code_page[-1]`, `code_page[-2]` - чтение за пределами массива!
+- **UNDEFINED BEHAVIOR** и потенциальный segfault
+
+**Сценарий эксплуатации:**
+1. Пользователь загружает пустую или поврежденную программу
+2. Функция читает произвольную память
+3. Возможен крах системы
+
+**Рекомендуемое исправление:**
+```cpp
+usize seek_program_END(u8* code_page) {
+  isize lastCommand = 105;
+  while (lastCommand >= 0 && code_page[lastCommand] == 0) {  // ДОБАВИТЬ ПРОВЕРКУ!
+    lastCommand--;
+  }
+
+  if(lastCommand < 0) return 0;  // Защита от пустой программы
+
+  if(lastCommand < 105) lastCommand++;
+  if(lastCommand < 105) lastCommand++;
+
+  return lastCommand;
+}
+```
+
+---
+
+### 12.2 КРИТИЧЕСКАЯ ПРОБЛЕМА: 5 бесконечных циклов без таймаута
+
+**Файлы:** `tools.cpp:76, 212, 233, 257, 298`
+**Серьезность:** КРИТИЧЕСКАЯ (Система может зависнуть навсегда)
+
+**Примеры:**
+```cpp
+// tools.cpp:76
+while (!flash.eraseSector(segment_address));  // ⚠️ БЕСКОНЕЧНЫЙ ЦИКЛ!
+
+// tools.cpp:212
+for(usize nSlot=0; nSlot <= MAX_SLOT_FOR_PROGRAM; nSlot++) {
+    while (!flash.eraseSector(nSlot * FLASH_SECTOR_SIZE));  // ⚠️ БЕСКОНЕЧНЫЙ!
+}
+
+// tools.cpp:233, 257, 298 - аналогично
+```
+
+**Проблема:**
+- Если SPI flash аппаратно неисправна или отключена
+- Если произошел сбой питания flash
+- Если flash заблокирован (write-protected)
+- **Система зависнет НАВСЕГДА** без возможности восстановления
+
+**Реальный сценарий:**
+1. Пользователь пытается сохранить программу
+2. Flash неисправна → eraseSector() всегда возвращает false
+3. МК зависает в бесконечном цикле
+4. **Требуется перезагрузка** (power cycle)
+
+**Улучшенное решение:**
+```cpp
+bool erase_slot_safe(usize nSlot) {
+  const isize segment_address = calc_address(nSlot);
+  if(segment_address < 0) return false;
+
+  dbgln(SPIROM, "SPIFLASH: erase sector #", segment_address);
+
+  // ДОБАВИТЬ ТАЙМАУТ:
+  uint32_t timeout = 10000;  // ~10 секунд
+  while (!flash.eraseSector(segment_address) && timeout--) {
+    delay(1);  // Задержка 1мс между попытками
+  }
+
+  if(timeout == 0) {
+    dbgln(ERROR, "Flash erase timeout!");
+    lcd.print("Flash error!");
+    sound(PIN_BUZZER, 4000, 1000);
+    return false;
+  }
+
+  return true;
+}
+```
+
+**Статистика проблемы:**
+- **5 мест** в коде с потенциальным зависанием
+- **100% шанс** зависания при сбое flash
+- **Критичность:** МАКСИМАЛЬНАЯ
+
+---
+
+### 12.3 ПРОБЛЕМА: Off-by-one в get_set_bit_position
+
+**Файл:** `keyboard.cpp:115-121`
+**Серьезность:** СРЕДНЯЯ
+
+```cpp
+inline isize get_set_bit_position(u8 row_code) {
+  for(usize bit_position = 0; bit_position <= KEY_IN_COLUMN; bit_position++){
+    //                                       ^^ ⚠️ ДОЛЖНО БЫТЬ '<' а не '<='
+    if((row_code & 1) != 0) return bit_position;
+    row_code >>= 1;
+  }
+  return -1;
+}
+```
+
+**Проблема:**
+- `KEY_IN_COLUMN = 8` (биты 0-7)
+- Цикл идет до `bit_position <= 8` (включительно!)
+- При `bit_position = 8` функция может вернуть **8**
+- Но валидные позиции только 0-7!
+
+**Последствия:**
+```cpp
+// keyboard.cpp:246
+const usize column = get_set_bit_position(bit_changed);
+const u8 code = (column*KEY_IN_ROW + row);
+// Если column = 8: code = 8*5 + row = 40+row = 40-44
+// KeyPairs[] имеет размер 40 элементов (0-39)
+// ВЫХОД ЗА ГРАНИЦЫ!
+```
+
+**Исправление:**
+```cpp
+inline isize get_set_bit_position(u8 row_code) {
+  for(usize bit_position = 0; bit_position < KEY_IN_COLUMN; bit_position++){
+    //                                       ^ ИСПРАВЛЕНО
+    if((row_code & 1) != 0) return bit_position;
+    row_code >>= 1;
+  }
+  return -1;
+}
+```
+
+---
+
+### 12.4 ПРОБЛЕМА: Дублирование кода в IK1303_Tick
+
+**Файл:** `mk61emu_core.cpp:1241-1252 и 1264-1275`
+**Серьезность:** НИЗКАЯ (Технический долг)
+
+**Дублированный код:**
+```cpp
+// ДУБЛИКАТ 1 (строки 1241-1252)
+if (m_IK1303.flag_FC > 0){
+    if (m_IK1303.key_y == 0) m_IK1303.T = 0;
+} else {
+    tmp = DIV3(signal_I);
+    if (tmp == m_IK1303.key_xm)
+        if (m_IK1303.key_y > 0) {
+            m_IK1303.S1 = m_IK1303.key_y;
+            m_IK1303.T = 1;
+        }
+    if (tmp < 12) if (m_IK1303.L > 0)  m_IK1303.comma = tmp;
+}
+
+// ДУБЛИКАТ 2 (строки 1264-1275) - ИДЕНТИЧНЫЙ КОД!
+if (m_IK1303.flag_FC > 0){
+    if (m_IK1303.key_y == 0) m_IK1303.T = 0;
+} else {
+    tmp = DIV3(signal_I);
+    if (tmp == m_IK1303.key_xm)
+        if (m_IK1303.key_y > 0) {
+            m_IK1303.S1 = m_IK1303.key_y;
+            m_IK1303.T = 1;
+        }
+    if (tmp < 12) if (m_IK1303.L > 0)  m_IK1303.comma = tmp;
+}
+```
+
+**Проблема:**
+- Одинаковый код повторяется дважды в разных ветках
+- Если нужно исправить баг, нужно исправлять в двух местах
+- Увеличивает размер кода без необходимости
+
+**Рефакторинг:**
+```cpp
+// Вынести в отдельную функцию
+inline void process_key_and_comma(IK1303& chip, uint32_t signal_I) {
+    if (chip.flag_FC > 0){
+        if (chip.key_y == 0) chip.T = 0;
+    } else {
+        uint32_t tmp = DIV3(signal_I);
+        if (tmp == chip.key_xm)
+            if (chip.key_y > 0) {
+                chip.S1 = chip.key_y;
+                chip.T = 1;
+            }
+        if (tmp < 12) if (chip.L > 0) chip.comma = tmp;
+    }
+}
+```
+
+---
+
+### 12.5 ПРОБЛЕМА: Циркулярный буфер клавиатуры - некорректная проверка
+
+**Файл:** `keyboard.cpp:74-76`
+**Серьезность:** СРЕДНЯЯ
+
+```cpp
+i8 cir_buff_get(usize index) {
+  if(cir_buff::IsEmpty() || index > cir_buff::count()) return -1;
+  //                                      ^ ⚠️ ДОЛЖНО БЫТЬ '>=' а не '>'
+  return buff[(read_count + index) & MASK];
+}
+```
+
+**Проблема:**
+- Если `index == count()`, то обращение `buff[(read_count + count()) & MASK]` выходит за пределы!
+- Пример: count() = 3, index = 3 → обращение к 4-му элементу (вне буфера)
+
+**Правильная проверка:**
+```cpp
+i8 cir_buff_get(usize index) {
+  if(cir_buff::IsEmpty() || index >= cir_buff::count()) return -1;
+  //                                      ^^ ИСПРАВЛЕНО
+  return buff[(read_count + index) & MASK];
+}
+```
+
+---
+
+### 12.6 ПРОБЛЕМА: Переполнение времени в check_hold_key
+
+**Файл:** `keyboard.cpp:126-127`
+**Серьезность:** НИЗКАЯ (проявится через 49 дней работы)
+
+```cpp
+const t_time_ms now = millis();
+if(press_time >= now) return;  // ⚠️ ПРОБЛЕМА при wraparound!
+```
+
+**Проблема:**
+- `millis()` переполняется через ~49 дней
+- Если `press_time` установлен перед переполнением, а `now` - после
+- Условие `press_time >= now` будет некорректным
+
+**Пример:**
+```
+press_time = 0xFFFFFFFE (перед переполнением)
+now = 0x00000001 (после переполнения)
+press_time >= now → true (некорректно!)
+```
+
+**Правильная проверка wraparound:**
+```cpp
+const t_time_ms now = millis();
+// Проверка с учетом переполнения:
+if((t_time_ms)(now - press_time) < KEY_HOLD_MS) return;
+```
+
+---
+
+### 12.7 ПРОБЛЕМА: Некорректная логика коррекции AMK
+
+**Файл:** `mk61emu_core.cpp:1051-1056`
+**Серьезность:** СРЕДНЯЯ (возможная неточность эмуляции)
+
+```cpp
+tmp = (uint8_t) m_IK1302.pAND_AMK[J_signal_I];
+if (tmp > 59 && m_IK1302.L == 0){
+    tmp++;  // 60→61, 61→62, 62→63, 63→64
+}
+```
+
+**Комментарий в коде говорит:**
+```cpp
+// Если AMK больше 59 (60,61,62,63), то пересчитываются
+// (60,62,64,66) или (61,63,65,67) при L=0
+```
+
+**Несоответствие:**
+- Комментарий: 60→60, 61→62, 62→64, 63→66
+- Код: 60→61, 61→62, 62→63, 63→64
+
+**Вопрос:** Что корректно - код или комментарий?
+
+**Рекомендация:** Требуется проверка по документации на К145ИК или тестирование на реальном железе.
+
+---
+
+### 12.8 ПРОБЛЕМА: Отсутствие volatile для аппаратных регистров
+
+**Анализ:** В коде НЕТ использования `volatile` для переменных, которые могут изменяться аппаратно или в ISR.
+
+**Потенциальные проблемы:**
+- Компилятор может оптимизировать обращения к переменным
+- При включении оптимизации `-O2` или `-O3` возможны race conditions
+
+**Рекомендация:** Если в будущем добавятся ISR (например, для таймера или UART), необходимо пометить разделяемые переменные как `volatile`.
+
+---
+
+## 13. ОБНОВЛЕННАЯ ОЦЕНКА КАЧЕСТВА
+
+### 13.1 Новая статистика проблем
+
+**КРИТИЧЕСКИЕ (требуют НЕМЕДЛЕННОГО исправления):**
+1. ⚠️ Underflow в seek_program_END (tools.cpp:82) - **КРАЙНЕ ОПАСНО**
+2. ⚠️ 5 бесконечных циклов без таймаута (tools.cpp) - **ЗАВИСАНИЕ СИСТЕМЫ**
+3. ⚠️ Buffer overflow в ReadSlotName:204 - **УЖЕ ИЗВЕСТНО**
+4. ⚠️ Переполнение индекса ROM в IK130x_GoZero - **ТЕОРЕТИЧЕСКИ ВОЗМОЖНО**
+
+**ВЫСОКИЙ ПРИОРИТЕТ:**
+5. ⚠️ Off-by-one в get_set_bit_position (keyboard.cpp:116)
+6. ⚠️ Off-by-one в cir_buff_get (keyboard.cpp:75)
+7. ⚠️ Недокументированность "sergey_anvarov_hack_enable"
+8. ⚠️ Wraparound проблема в check_hold_key (keyboard.cpp:127)
+
+**СРЕДНИЙ ПРИОРИТЕТ:**
+9. ⚠️ Дублирование кода в IK1303_Tick (технический долг)
+10. ⚠️ Несоответствие код/комментарий в коррекции AMK
+11. ⚠️ Отсутствие валидации BCD-операций
+
+**ИТОГО:**
+- **4 критических** (vs 8 в предыдущем отчете)
+- **4 высокого приоритета** (vs 15 в предыдущем)
+- **3 среднего приоритета** (vs 23 в предыдущем)
+
+### 13.2 Обновленная оценка
+
+**После второго прохода анализа:**
+- Качество кода: **7.2/10** (с учетом новых находок)
+- Критичность проблем: **ВЫСОКАЯ** (underflow и бесконечные циклы)
+- Готовность к продакшну: **СРЕДНЯЯ** (после исправления критических багов)
+
+**Основной вывод второго анализа:**
+Код содержит **меньше проблем**, чем указано в первом отчете, но найденные проблемы **более критичны** (underflow, бесконечные циклы). После исправления 4 критических багов код можно считать стабильным для hobby-использования.
+
+---
+
+## 14. ПРИОРИТИЗИРОВАННЫЙ ПЛАН ИСПРАВЛЕНИЙ
+
+### НЕМЕДЛЕННО (Критические баги):
+
+**1. Исправить underflow в seek_program_END**
+```cpp
+// tools.cpp:80
+while (lastCommand >= 0 && code_page[lastCommand] == 0) {
+    lastCommand--;
+}
+if(lastCommand < 0) return 0;
+```
+
+**2. Добавить таймауты ко всем flash операциям**
+```cpp
+// tools.cpp:76, 212, 233, 257, 298
+uint32_t timeout = 10000;
+while (!flash.eraseSector(addr) && timeout--) delay(1);
+if(timeout == 0) { /* error handling */ }
+```
+
+**3. Исправить buffer overflow в ReadSlotName**
+```cpp
+// tools.cpp:204
+slot_name[15] = 0;  // НЕ 16!
+```
+
+**4. Валидировать индекс ROM**
+```cpp
+// mk61emu_core.cpp:907
+const uint16_t ip = R[36] + 16*R[39];
+if(ip >= 256) return 0;  // защита
+```
+
+### В ТЕЧЕНИЕ НЕДЕЛИ:
+
+**5. Исправить off-by-one в get_set_bit_position**
+```cpp
+for(usize bit_position = 0; bit_position < KEY_IN_COLUMN; bit_position++)
+```
+
+**6. Исправить проверку в cir_buff_get**
+```cpp
+if(cir_buff::IsEmpty() || index >= cir_buff::count()) return -1;
+```
+
+**7. Документировать sergey_anvarov_hack**
+
+**8. Исправить wraparound в check_hold_key**
+```cpp
+if((t_time_ms)(now - press_time) < KEY_HOLD_MS) return;
+```
+
+### СРЕДНИЙ СРОК:
+
+**9. Рефакторинг дублированного кода**
+**10. Проверить логику коррекции AMK**
+**11. Добавить unit-тесты**
+
+---
+
+**Дата второго прохода:** 2025-11-27 (вечер)
+**Дата первого прохода:** 2025-11-27 (день)
+**Автор анализа:** Claude (Anthropic AI - Углубленный построчный экспертный анализ)
+**Методология:** Двухпроходный статический анализ, анализ граничных условий, поиск переполнений
+**Использованные инструменты:** Статический анализ, трассировка выполнения, анализ всех циклов и массивов
